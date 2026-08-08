@@ -2025,9 +2025,39 @@ def _load_cfg():
 # worktree-controlled code (pip/npm builds, pod CLI). The gateway's full
 # environment carries credentials (Slack/cloud tokens) that build scripts
 # must never be able to read.
-_SAFE_ENV_KEYS = (
+_POSIX_SAFE_ENV_KEYS = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR",
     "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+)
+
+# Windows counterparts of the POSIX set above. Names are UPPERCASE because
+# ``os.environ`` upper-cases every key on Windows, and the allowlist filters by
+# exact key match -- a mixed-case ``"SystemRoot"`` would never match and the
+# variable would be silently dropped.
+#
+# SYSTEMROOT is load-bearing, not cosmetic: Winsock locates its socket catalog
+# through it, so a child without it cannot resolve names at all. libcurl's
+# threaded resolver reports that as ``getaddrinfo() thread failed to start``,
+# which is what a credential-bearing ``git fetch`` fails with here. The rest
+# keep git and the node/pip toolchains functional: git reads its global config
+# through USERPROFILE, npm and pip need APPDATA/LOCALAPPDATA plus a writable
+# TEMP, PATHEXT is required to resolve ``.exe``/``.cmd`` at all, and
+# NUMBER_OF_PROCESSORS sizes build parallelism.
+#
+# This is platform parity, not a wider boundary: USERPROFILE/APPDATA are the
+# Windows equivalents of the POSIX HOME already allowlisted above, and every
+# name here is a platform path rather than a secret. No credential-bearing
+# variable is added, so build steps still cannot read Slack/cloud tokens.
+_WINDOWS_SAFE_ENV_KEYS = (
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+    "TEMP", "TMP", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+)
+
+_SAFE_ENV_KEYS = _POSIX_SAFE_ENV_KEYS + (
+    _WINDOWS_SAFE_ENV_KEYS if platform_compat.IS_WINDOWS else ()
 )
 
 

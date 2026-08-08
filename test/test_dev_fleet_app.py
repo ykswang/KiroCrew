@@ -921,6 +921,53 @@ def test_build_env_excludes_credentials(monkeypatch):
     assert mod._build_env(with_credentials=True)["PATH"] == mod._TRUSTED_PATH
 
 
+def test_windows_safe_env_keys_are_uppercase():
+    """``os.environ`` upper-cases keys on Windows, and the allowlist filters by
+    exact match — a mixed-case entry would never match and would be dropped."""
+    for key in mod._WINDOWS_SAFE_ENV_KEYS:
+        assert key == key.upper(), f"{key!r} would never match os.environ"
+
+
+def test_windows_safe_env_keys_carry_no_credentials():
+    """The Windows additions are platform paths, never secret-bearing vars."""
+    for key in mod._WINDOWS_SAFE_ENV_KEYS:
+        for marker in ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "APIKEY"):
+            assert marker not in key, f"{key!r} looks credential-bearing"
+
+
+def test_safe_env_keys_platform_composition():
+    """The POSIX set always applies; the Windows set only on Windows."""
+    posix = set(mod._POSIX_SAFE_ENV_KEYS)
+    windows = set(mod._WINDOWS_SAFE_ENV_KEYS)
+    active = set(mod._SAFE_ENV_KEYS)
+
+    assert not (posix & windows), "the two sets must stay disjoint"
+    assert posix <= active
+    if platform_compat.IS_WINDOWS:
+        assert windows <= active
+    else:
+        assert not (windows & active)
+
+
+@pytest.mark.skipif(
+    not platform_compat.IS_WINDOWS, reason="Windows-only env semantics"
+)
+def test_build_env_carries_systemroot_on_windows(monkeypatch):
+    """SYSTEMROOT must reach every build/fetch child.
+
+    Winsock locates its socket catalog through it, so a child without it cannot
+    resolve names at all — libcurl reports that as ``getaddrinfo() thread failed
+    to start`` and the Pull step fails before it reaches the network.
+    """
+    monkeypatch.setenv("SYSTEMROOT", r"C:\WINDOWS")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-secret")
+
+    for env in (mod._build_env(), mod._build_env(with_credentials=True), mod._pod_env()):
+        assert env["SYSTEMROOT"] == r"C:\WINDOWS"
+        # Widening the allowlist must not have widened it to credentials.
+        assert "SLACK_BOT_TOKEN" not in env
+
+
 def test_read_pin_strict_rejects_symlinked_env(tmp_path):
     """A symlinked pin file must raise, never be read (Codex R24 #2)."""
     import kiro_crew.apps.builtins.dev_fleet.server as mod
