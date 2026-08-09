@@ -24,6 +24,9 @@ import time
 import urllib.request
 from typing import Any
 
+from kiro_crew import platform_compat
+from kiro_crew.env import ensure_node, node_augmented_path
+
 # Stdlib-only leaf (it imports urllib.request and nothing else), so this
 # top-level import does not pull the gateway into this stdio proxy -- the same
 # constraint that makes _internal_secret() reach for the config.paths leaf.
@@ -1007,7 +1010,9 @@ def _is_npx_launcher(cmd: str) -> bool:
     return os.path.splitext(os.path.basename(cmd))[0].lower() == "npx"
 
 
-def _resolve_playwright_cmd(search_path: str | None = None) -> str | None:
+def _resolve_playwright_cmd(
+    search_path: str | None = None, *, node_bin_dir: str | None = None
+) -> str | None:
     """Find the public ``@playwright/mcp`` CLI, resolving via PATH/npx.
 
     Resolution order:
@@ -1016,13 +1021,11 @@ def _resolve_playwright_cmd(search_path: str | None = None) -> str | None:
       3. ``npx`` — the public ``@playwright/mcp`` package is launched via
          ``npx @playwright/mcp`` when no standalone binary is installed.
 
-    ``search_path`` overrides the PATH ``shutil.which`` searches. The proxy (a
-    standalone CLI process) passes ``None`` and searches its own inherited PATH.
-    The setup path passes a Node-AUGMENTED PATH so a version-manager /
-    ``ensure-node.sh`` toolchain the gateway daemon did not inherit is still
-    found — without it, a daemon that bootstrapped Node via the ``node-bin-dir``
-    marker (which is NOT written into ``os.environ["PATH"]``) would resolve
-    ``ensure_node()`` yet see no ``npx`` here and wrongly conclude no launcher.
+    ``search_path`` overrides the PATH used for standalone launchers. On Windows,
+    ``node_bin_dir`` also narrows standalone launcher lookup because ``.CMD``
+    wrappers invoke their sibling Node. It always narrows the ``npx`` lookup to
+    the already-validated Node toolchain. Setup and the proxy both pass it after
+    :func:`kiro_crew.env.ensure_node` selects a runtime.
 
     Returns ``None`` when no launcher is resolvable (e.g. Node/npm absent),
     so callers can fail gracefully rather than spawning a missing binary.
@@ -1030,15 +1033,20 @@ def _resolve_playwright_cmd(search_path: str | None = None) -> str | None:
     override = os.environ.get("KIROCREW_PLAYWRIGHT_CMD")
     if override:
         return override
+    launcher_path = (
+        node_bin_dir
+        if platform_compat.IS_WINDOWS and node_bin_dir is not None
+        else search_path
+    )
     for binary in ("mcp-server-playwright", "playwright-mcp"):
-        found = shutil.which(binary, path=search_path)
+        found = shutil.which(binary, path=launcher_path)
         if found:
             return found
     # Return the RESOLVED path, never the bare name: on Windows npx ships only
     # as ``npx.CMD`` and CreateProcess does not apply PATHEXT, so spawning the
     # literal "npx" raises FileNotFoundError even though PATHEXT-aware
     # shutil.which found it.
-    npx = shutil.which("npx", path=search_path)
+    npx = shutil.which("npx", path=node_bin_dir if node_bin_dir is not None else search_path)
     if npx:
         return npx
     return None
@@ -1046,18 +1054,40 @@ def _resolve_playwright_cmd(search_path: str | None = None) -> str | None:
 
 def run_proxy(args: list[str]) -> None:
     """Main proxy loop."""
-    # Augment PATH with the Node toolchain dirs BEFORE resolving, and export it to
-    # every child. The gateway spawns this proxy with its own inherited PATH, which
-    # on a marker-bootstrapped host (Node installed by ensure-node.sh, recorded in
-    # the node-bin-dir marker, NOT written into os.environ["PATH"]) lacks npx. Setup
-    # resolves the launcher on exactly this augmented PATH, so without matching it
-    # here setup would detect npx and skip priming while the runtime proxy then
-    # can't find npx to launch — the "setup and runtime resolve from different
-    # PATHs" split. Aligning them is what keeps enable and launch consistent.
-    from kiro_crew.env import node_augmented_path
-
-    os.environ["PATH"] = node_augmented_path(os.environ.get("PATH", ""))
-    playwright_cmd = _resolve_playwright_cmd()
+    # An explicit native launcher can provide Playwright through Docker or another
+    # non-Node runtime. Node-backed launchers still select and promote the same
+    # supported Node setup validates, without invoking the installer here.
+    playwright_cmd = os.environ.get("KIROCREW_PLAYWRIGHT_CMD")
+    node: str | None = None
+    node_required = (
+        not playwright_cmd
+        or playwright_cmd.endswith(".js")
+        or _is_npx_launcher(playwright_cmd)
+    )
+    if node_required:
+        node = ensure_node(bootstrap=False)
+        if node is None:
+            error_resp = {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "error": {
+                    "code": -32000,
+                    "message": (
+                        "The browser tools need Node.js 18 or newer. "
+                        "Finish setup in Settings > Browser."
+                    ),
+                },
+            }
+            _write_message(sys.stdout.buffer, error_resp)
+            sys.exit(1)
+        selected_node_bin = os.path.dirname(os.path.abspath(node))
+        os.environ["PATH"] = node_augmented_path(
+            os.environ.get("PATH", ""), preferred_node=node
+        )
+        # A separate proxy process cannot rely on gateway process memory. Every
+        # child inherits the promoted PATH; launcher lookup is additionally
+        # constrained so Windows wrappers cannot select an unsupported node.exe.
+        playwright_cmd = _resolve_playwright_cmd(node_bin_dir=selected_node_bin)
     if playwright_cmd is None:
         error_resp = {
             "jsonrpc": "2.0",
@@ -1075,7 +1105,8 @@ def run_proxy(args: list[str]) -> None:
         sys.exit(1)
     spawn_env = dict(os.environ)
     if playwright_cmd.endswith(".js"):
-        cmd = ["node", playwright_cmd] + args
+        assert node is not None
+        cmd = [node, playwright_cmd] + args
     elif _is_npx_launcher(playwright_cmd):
         # npx fetches the package on first use. ``--yes`` suppresses the install
         # prompt (an npx flag, so it precedes the package spec). Launch the EXACT
@@ -1108,7 +1139,7 @@ def run_proxy(args: list[str]) -> None:
 
     try:
         proc = subprocess.Popen(
-            cmd,
+            cmd,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args -- the operator chooses this executable via KIROCREW_PLAYWRIGHT_CMD and argv is never parsed by a shell  # noqa: E501
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=sys.stderr,

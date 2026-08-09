@@ -293,6 +293,20 @@ def test_node_augmented_path_with_empty_base_has_no_empty_entry(isolated_home):
     assert "" not in env_mod.node_augmented_path("").split(os.pathsep)
 
 
+def test_node_augmented_path_promotes_validated_runtime(isolated_home, tmp_path):
+    stale = _fake_node_bin(isolated_home / ".volta" / "bin")
+    selected = _fake_node_bin(tmp_path / "supported" / "bin")
+    node_name = "node.exe" if platform_compat.IS_WINDOWS else "node"
+
+    parts = env_mod.node_augmented_path(
+        os.pathsep.join((str(stale), "/system/bin")),
+        preferred_node=str(selected / node_name),
+    ).split(os.pathsep)
+
+    assert parts[0] == str(selected)
+    assert parts[1] == str(stale)
+
+
 def test_find_node_tool_returns_absolute_path(isolated_home):
     d = _fake_node_bin(isolated_home / ".volta" / "bin")
     found = env_mod.find_node_tool("npm", "")

@@ -68,6 +68,47 @@ launchable the SAME way the proxy runs it and the whole MCP ecosystem installs i
   "package"` with the two npm-free paths — the official Docker image
   (`mcr.microsoft.com/playwright/mcp`) and the `KIROCREW_PLAYWRIGHT_CMD` override.
 
+**Node resolution for desktop launches.** A packaged desktop gateway inherits
+its environment from Launch Services, not an interactive shell, so exports in
+`~/.zshrc` are absent. Node tools resolve in this order:
+
+1. `KIROCREW_NODE_BIN_DIR`, then the `<data-home>/node-bin-dir` marker written by
+   `ensure-node.sh` or an operator outside the application;
+2. supported version-manager layouts (mise, asdf, nvm, fnm, Volta, and n), then
+   the inherited `PATH`.
+
+Browser Mode does not automatically execute Node from macOS package-manager
+fallback directories such as `/opt/homebrew/bin` or `/usr/local/bin`; the
+resolver uses explicit operator state and existing version-manager layouts
+instead of accumulating package-manager-specific guesses. A Finder/Dock launch
+that cannot see Homebrew Node must use an operator-written marker or a
+process-manager environment override. Setup probes candidates in precedence
+order and selects the first Node `>=18`, matching the declared runtime
+requirement of `@playwright/mcp`, so an older marker or inherited Node does not
+hide a supported candidate later in the search. Setup then promotes that exact
+Node's bin directory ahead of every stale candidate, resolves `npx` only from
+that directory, and invokes `playwright-core` with the selected Node executable.
+The runtime proxy is a separate process, so it repeats the supported-version
+probe at startup without invoking the installer, applies the same PATH ordering,
+and uses the selected Node directly for JavaScript launchers. If no supported
+Node is present, it fails immediately with a Settings > Browser setup hint. The
+stricter frontend-build range remains owned by `ensure-node.sh`.
+
+`node-bin-dir` is an executable trust root: Browser Mode later runs its
+`node`/`npm`/`npx` in the unsandboxed gateway. The marker is therefore on the
+read/write sensitive-path floor. Trusted setup code and an operator writing the
+file outside the agent tool path do not traverse that gate. Automatic
+version-manager layouts remain a same-UID trust surface shared with the build
+toolchain, so omitting package-manager guesses is a discovery-scope choice rather
+than a complete same-UID security boundary. Strict deployments should provide an
+operator-selected, separately protected Node directory.
+
+Resolver discovery remains cached for the gateway process lifetime. An operator
+who changes `node-bin-dir` or `KIROCREW_NODE_BIN_DIR` must restart Kiro Crew; a
+Settings retry does not make a newly written executable eligible. The trusted
+bootstrap path clears the cache only after `ensure-node.sh` completes so the Node
+installation it created is available immediately.
+
 **Public-registry pin.** Every npm/npx fetch Kiro Crew triggers — the prime, the
 browser install, and the proxy's own runtime `npx` launch — pins the public
 registry via `npm_config_registry=https://registry.npmjs.org/` in the child env.
@@ -86,9 +127,16 @@ cache, no registry round-trip) and stops `latest` from advancing past the browse
 revision provisioned at enable time (the "Executable doesn't exist" drift). The
 flag is validated against a strict semver pattern on read, so a tampered value
 degrades to `@latest` rather than reaching an npx argv; absent, it also falls back
-to `@latest`. It resolves through the shared launch path, not the runtime PATH,
-which setup and the proxy now derive identically via `node_augmented_path` so a
-marker-bootstrapped Node toolchain the gateway did not inherit is found by both.
+to `@latest`. Setup and the proxy both validate Node before deriving their launch
+PATH with `node_augmented_path(preferred_node=...)`; a marker-bootstrapped
+toolchain the gateway did not inherit is therefore found without letting an
+unsupported earlier toolchain execute the launcher.
+
+To install the revision-matched browser, setup resolves
+`playwright-core/package.json` through Node and joins its sibling `cli.js`.
+`playwright-core` does not export the `playwright-core/cli.js` package subpath,
+so resolving that subpath directly is invalid even though the file is bundled
+inside `@playwright/mcp`.
 
 **Provisioning is always advisory — enabling never surfaces a raw error.** Turning
 Browser Mode on registers the proxy (the capability is on) BEFORE and independent
@@ -103,14 +151,25 @@ The outcome is honest about usability without ever being alarming:
   (offline, unwritable/full cache). Honestly not-yet-usable (a headless browse needs
   the executable), so NOT reported as usable — but still a calm "toggle off/on to
   retry" note, never a stderr dump.
-- **`ok: false, step: "node" | "package"`** — no Node, or no npm/npx launcher; calm
-  "Browser Mode is on; to finish setup…" note naming the Docker / `KIROCREW_PLAYWRIGHT_CMD`
-  paths.
+- **`ok: false, step: "node" | "package"`** — no supported Node, or no npm/npx
+  launcher; calm "Browser Mode is on; to finish setup…" note. The Node outcome
+  includes a shell-native `manual_command` that writes the terminal's Node bin
+  directory to the marker and requires a full app restart. On Windows the detail
+  names PowerShell explicitly. The process-level `KIROCREW_NODE_BIN_DIR`
+  alternative remains in the install and configuration docs instead of the
+  compact Settings advisory. The package outcome names Docker and
+  `KIROCREW_PLAYWRIGHT_CMD`.
 
 The dashboard renders every one of these as a MUTED advisory (info icon), never a
 red error. `ensure_playwright_installed` is best-effort and never raises; the save
 handler also wraps the call so an unexpected exception still returns 200 with a
 deferred note rather than 500-ing. It returns a structured `{ok, step, detail, engine}`.
+The dashboard state retains the latest structured result for the gateway process,
+and `GET /api/browser/config` includes it while Browser Mode is enabled and the
+selected engine still matches. Leaving and returning to Settings therefore replays
+the same step-specific guidance instead of replacing a restart-required Node
+outcome with a generic toggle retry. A full app restart clears both this transient
+result and the cached Node-directory discovery.
 
 **Browser Mode is a persistent capability toggle.** The durable
 `browser-mode-enabled` flag file under the data home is the gate. While it is on,
